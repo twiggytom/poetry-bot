@@ -1,0 +1,18 @@
+.venv/
+.DS_Store
+__pycache__/
+*.py[cod]
+.env
+.pytest_cache/
+.mypy_cache/
+data/
+.cache/
+checkpoints/
+
+# Colab notebooks: saved cell outputs can contain generated poems and Drive paths
+*.ipynb
+.ipynb_checkpoints/
+# Trained adapters / generation logs, if a run folder is ever downloaded here
+run_*/
+*.safetensors
+generations.jsonl

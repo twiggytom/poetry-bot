@@ -1,0 +1,6 @@
+requests>=2.31
+beautifulsoup4>=4.12
+langdetect>=1.0.9
+transformers>=4.45
+jinja2>=3.1
+python-dotenv>=1.0
