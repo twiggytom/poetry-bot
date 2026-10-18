@@ -1,0 +1,44 @@
+#training configs for LoRA on Ministral 3 8B (base)
+
+# needs transformers v5 (pip install -U transformers)
+
+model:
+  base_model: mistralai/Ministral-3-8B-Base-2512
+  # Ministral 3 is a vision-language model; AutoModelForCausalLM can't load it
+  loader: image_text_to_text
+  # the base tokenizer ships without a chat template, so use Mistral's
+  # [INST] format: <s>[INST]prompt[/INST]poem</s>
+  chat_template: >-
+    {{ bos_token }}{% for message in messages %}{% if message['role'] == 'user' %}[INST]{{ message['content'] }}[/INST]{% elif message['role'] == 'assistant' %}{{ message['content'] }}{{ eos_token }}{% endif %}{% endfor %}
+  # longest current example is 1203 tokens with this tokenizer
+  max_seq_length: 1280
+
+data:
+  train_file: data/processed_training.json
+  val_file: data/processed_val.json
+  test_file: data/processed_test.json
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+
+  # same seven projections as the Qwen configs, but only in the language model:
+  # the vision tower reuses these layer names, and a plain list would adapt it too
+  target_modules: .*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)
+
+training:
+  learning_rate: 2.0e-4
+  num_epochs: 3
+  per_device_batch_size: 4
+  gradient_accumulation_steps: 4
+  lr_scheduler: cosine
+  warmup_ratio: 0.05
+  precision: bf16
+  eval_steps: 25
+  save_steps: 25
+  save_total_limit: 3
+  logging_steps: 5
+  per_device_eval_batch_size: 4
+  gradient_checkpointing: true
+  seed: 42

@@ -4,6 +4,9 @@
 
 # loads in adapter and base model weights -> asks user for prompt -> streams poem back
 
+# works with any run from training.py (Qwen2.5-1.5B, Qwen2.5-7B, Ministral 3 8B): the base
+# model, loader and chat template all come from the train.yaml saved in the run folder
+
 # issues surrounding repetition that may be a result of inference script/settings
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ import yaml
 from peft import PeftModel
 from transformers import (
     AutoModelForCausalLM,
+    AutoModelForImageTextToText,
     AutoTokenizer,
     LogitsProcessor,
     LogitsProcessorList,
@@ -40,11 +44,18 @@ TOKENS_PER_WORD_CAP = 1.6
 OVERSHOOT_WORDS = 100
 # Code identifiers the base model associates with a bare "." token; they occur
 # in none of the training poems, so they are never a legitimate continuation.
+# (Qwen vocabulary; tokens missing from another model's vocabulary are skipped.)
 SUPPRESSED_TOKENS = ("_Statics", "Statics")
 
+# model.loader in the run's train.yaml; must match LOADERS in training.py
+LOADERS = {"causal_lm": AutoModelForCausalLM, "image_text_to_text": AutoModelForImageTextToText}
 
-def find_run_dir(output_root: str, run: str | None) -> str:
-    """The named run (a folder name or a full path), else the newest run_* folder."""
+
+def find_run_dir(output_root: str, run: str | None, model: str | None = None) -> str:
+    """The named run (a folder name or a full path), else the newest run_* folder.
+
+    With `model` (e.g. qwen2.5-7b), only runs trained from config/train_<model>.yaml count.
+    """
     if run:
         path = run if os.path.isabs(run) else os.path.join(output_root, run)
         if not os.path.isfile(os.path.join(path, "adapter_config.json")):
@@ -55,12 +66,28 @@ def find_run_dir(output_root: str, run: str | None) -> str:
             f"Output folder not found: {output_root}\n"
             "Mount Google Drive in a notebook cell first:\n"
             "    from google.colab import drive; drive.mount('/content/drive')")
-    # run_YYYYMMDD-HHMMSS names sort chronologically.
-    runs = sorted(d for d in glob.glob(os.path.join(output_root, "run_*"))
+    # run_YYYYMMDD-HHMMSS[_model] names sort chronologically.
+    pattern = f"run_*_{model}" if model else "run_*"
+    runs = sorted(d for d in glob.glob(os.path.join(output_root, pattern))
                   if os.path.isfile(os.path.join(d, "adapter_config.json")))
     if not runs:
-        raise SystemExit(f"No run folders with an adapter in {output_root}")
+        which = f"{model} runs" if model else "run folders"
+        raise SystemExit(f"No {which} with an adapter in {output_root}")
     return runs[-1]
+
+
+def poem_end_id(tokenizer) -> int:
+    """The token the chat template closes the assistant turn with.
+
+    Training ended every poem with it, so it is what the model learned to stop on:
+    <|im_end|> for Qwen's template, </s> for Ministral's.
+    """
+    probe = "POEM_END_PROBE"
+    text = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "x"}, {"role": "assistant", "content": probe}], tokenize=False)
+    tail = tokenizer(text.split(probe, 1)[1], add_special_tokens=False)["input_ids"]
+    special = set(tokenizer.all_special_ids)
+    return next((i for i in tail if i in special), tokenizer.eos_token_id)
 
 
 def pick_dtype() -> torch.dtype:
@@ -171,17 +198,22 @@ class PoemWriter:
         self.max_seq_length = train_config["model"]["max_seq_length"]
         self.settings = settings
 
+        model_cfg = train_config["model"]
         self.tokenizer = AutoTokenizer.from_pretrained(run_dir)
-        base = AutoModelForCausalLM.from_pretrained(
-            train_config["model"]["base_model"], dtype=pick_dtype(),
+        if model_cfg.get("chat_template"):
+            # Already saved with the tokenizer; set again so it is the exact training format.
+            self.tokenizer.chat_template = model_cfg["chat_template"]
+        loader = LOADERS[model_cfg.get("loader", "causal_lm")]
+        base = loader.from_pretrained(
+            model_cfg["base_model"], dtype=pick_dtype(),
             device_map="auto" if torch.cuda.is_available() else None)
         self.model = PeftModel.from_pretrained(base, run_dir)
         self.model.eval()
 
-        # The model learned to close each poem with <|im_end|>; the base
-        # tokenizer's own eos is <|endoftext|>. Stop on either.
-        self.end_id = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
-        self.stop_ids = [self.end_id, self.tokenizer.eos_token_id]
+        # Stop on the token training ended poems with, or the tokenizer's own eos
+        # (for Qwen these differ: <|im_end|> vs <|endoftext|>).
+        self.end_id = poem_end_id(self.tokenizer)
+        self.stop_ids = list(dict.fromkeys([self.end_id, self.tokenizer.eos_token_id]))
         vocab = self.tokenizer.get_vocab()
         self.suppressed = [vocab[t] for t in SUPPRESSED_TOKENS if t in vocab]
         self.word_mask = word_token_mask(self.tokenizer)
@@ -239,6 +271,8 @@ def main() -> None:
                                          "omit to type prompts one after another")
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--run", help="run folder name (or full path); overrides the config")
+    parser.add_argument("--model", help="use the newest run of this model, e.g. qwen2.5-7b or "
+                                        "ministral3-8b (ignored when a run is named)")
     parser.add_argument("--no-save", action="store_true",
                         help="don't append poems to generations.jsonl")
     args = parser.parse_args()
@@ -249,9 +283,11 @@ def main() -> None:
     if not 0 < length["min_words"] <= length["max_words"]:
         raise SystemExit("config: need 0 < min_words <= max_words")
 
-    run_dir = find_run_dir(settings["output_root"], args.run or settings["run"])
+    run_dir = find_run_dir(settings["output_root"], args.run or settings["run"], args.model)
     device = "GPU" if torch.cuda.is_available() else "CPU (no GPU found; this will be slow)"
-    print(f"Loading adapter from {run_dir} on {device}")
+    with open(os.path.join(run_dir, "train.yaml"), encoding="utf-8") as fh:
+        base_model = yaml.safe_load(fh)["model"]["base_model"]
+    print(f"Loading adapter from {run_dir} ({base_model}) on {device}")
     writer = PoemWriter(run_dir, settings)
     log_path = os.path.join(run_dir, "generations.jsonl")
     save = settings["save_generations"] and not args.no_save

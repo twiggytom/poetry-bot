@@ -16,3 +16,5 @@ checkpoints/
 run_*/
 *.safetensors
 generations.jsonl
+
+CLAUDE.md

@@ -19,6 +19,7 @@ import yaml
 from peft import LoraConfig, get_peft_model
 from transformers import (
     AutoModelForCausalLM,
+    AutoModelForImageTextToText,
     AutoTokenizer,
     DataCollatorForSeq2Seq,
     Trainer,
@@ -28,12 +29,15 @@ from transformers import (
 )
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-DEFAULT_CONFIG = os.path.join(PROJECT_ROOT, "config", "train.yaml")
+CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
 DRIVE_OUTPUTS = "/content/drive/MyDrive/poetry-lora-outputs"
 LOCAL_CHECKPOINTS = "/content/checkpoints" if os.path.isdir("/content") \
     else os.path.join(PROJECT_ROOT, "checkpoints")
 
 IGNORE_INDEX = -100   # label value the loss skips
+
+# model.loader in the config; vision-language models like Ministral 3 aren't causal LMs to HF
+LOADERS = {"causal_lm": AutoModelForCausalLM, "image_text_to_text": AutoModelForImageTextToText}
 
 # generated loss curves
 TRAIN_COLOR, EVAL_COLOR = "#2a78d6", "#eb6834"
@@ -67,6 +71,18 @@ def encode(tokenizer, poem: dict, max_length: int) -> dict:
     return {"input_ids": input_ids, "attention_mask": [1] * len(input_ids), "labels": labels}
 
 
+def resolve_config(name: str) -> str:
+    """A config path, or a model name like qwen2.5-7b for config/train_qwen2.5-7b.yaml."""
+    if os.path.isfile(name):
+        return name
+    path = os.path.join(CONFIG_DIR, f"train_{name}.yaml")
+    if os.path.isfile(path):
+        return path
+    available = sorted(f[len("train_"):-len(".yaml")] for f in os.listdir(CONFIG_DIR)
+                       if f.startswith("train_") and f.endswith(".yaml"))
+    raise SystemExit(f"No training config {name!r}. Available: {', '.join(available)}")
+
+
 # ---------------------------------------------------------------- training
 
 class EvaluateOnFinalStep(TrainerCallback):
@@ -92,7 +108,7 @@ def precision_flags(precision: str) -> dict:
                          "Runtime > Change runtime type > GPU.")
     if precision == "bf16" and not torch.cuda.is_bf16_supported():
         raise SystemExit("This GPU does not support bf16 (e.g. a T4). Use an L4 or A100 "
-                         "runtime, or set precision: fp16 in config/train.yaml.")
+                         "runtime, or set precision: fp16 in the training config.")
     return {"bf16": precision == "bf16", "fp16": precision == "fp16"}
 
 
@@ -163,7 +179,9 @@ def save_plots(log_history: list[dict], best_step: int | None, out_dir: str) -> 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", default=DEFAULT_CONFIG)
+    parser.add_argument("--config", required=True,
+                        help="model name (e.g. qwen2.5-7b for config/train_qwen2.5-7b.yaml) "
+                             "or a path to a training config")
     parser.add_argument("--output-root", default=DRIVE_OUTPUTS,
                         help="existing folder the run folder is created in")
     parser.add_argument("--checkpoint-dir", default=LOCAL_CHECKPOINTS,
@@ -177,12 +195,19 @@ def main() -> None:
             "Mount Google Drive in a notebook cell first:\n"
             "    from google.colab import drive; drive.mount('/content/drive')")
 
-    with open(args.config, encoding="utf-8") as fh:
+    config_path = resolve_config(args.config)
+    with open(config_path, encoding="utf-8") as fh:
         config = yaml.safe_load(fh)
     model_cfg, data_cfg, lora_cfg, train_cfg = (
         config["model"], config["data"], config["lora"], config["training"])
+    loader = model_cfg.get("loader", "causal_lm")
+    if loader not in LOADERS:
+        raise SystemExit(f"model.loader must be one of {', '.join(LOADERS)}, not {loader!r}")
+    print(f"Config: {config_path}")
 
-    run_name = datetime.now().strftime("run_%Y%m%d-%H%M%S")
+    # Timestamp first so run folders still sort chronologically.
+    model_tag = os.path.splitext(os.path.basename(config_path))[0].removeprefix("train_")
+    run_name = datetime.now().strftime("run_%Y%m%d-%H%M%S") + f"_{model_tag}"
     run_dir = os.path.join(args.output_root, run_name)
     checkpoint_dir = os.path.join(args.checkpoint_dir, run_name)
 
@@ -191,6 +216,12 @@ def main() -> None:
 
     # Tokenizer and data.
     tokenizer = AutoTokenizer.from_pretrained(model_cfg["base_model"])
+    if model_cfg.get("chat_template"):
+        # Saved with the tokenizer below, so inference formats prompts the same way.
+        tokenizer.chat_template = model_cfg["chat_template"]
+    if not tokenizer.chat_template:
+        raise SystemExit(f"{model_cfg['base_model']} has no chat template; "
+                         "set model.chat_template in the config")
     max_length = model_cfg["max_seq_length"]
     train_set = [encode(tokenizer, p, max_length) for p in load_poems(data_cfg["train_file"])]
     val_set = [encode(tokenizer, p, max_length) for p in load_poems(data_cfg["val_file"])]
@@ -198,8 +229,10 @@ def main() -> None:
 
     # Base model with LoRA adapters.
     dtype = torch.bfloat16 if flags["bf16"] else torch.float16 if flags["fp16"] else torch.float32
-    model = AutoModelForCausalLM.from_pretrained(model_cfg["base_model"], dtype=dtype)
+    model = LOADERS[loader].from_pretrained(model_cfg["base_model"], dtype=dtype)
     model.config.use_cache = False   # incompatible with gradient checkpointing
+    if hasattr(model.config, "text_config"):
+        model.config.text_config.use_cache = False
     model = get_peft_model(model, LoraConfig(
         r=lora_cfg["r"],
         lora_alpha=lora_cfg["alpha"],
@@ -261,9 +294,10 @@ def main() -> None:
     os.makedirs(run_dir)
     trainer.model.save_pretrained(run_dir)
     tokenizer.save_pretrained(run_dir)
-    shutil.copy(args.config, os.path.join(run_dir, "train.yaml"))
+    shutil.copy(config_path, os.path.join(run_dir, "train.yaml"))
     with open(os.path.join(run_dir, "training_summary.json"), "w", encoding="utf-8") as fh:
         json.dump({
+            "config": os.path.basename(config_path),
             "base_model": model_cfg["base_model"],
             "best_step": best_step,
             "best_eval_loss": state.best_metric,

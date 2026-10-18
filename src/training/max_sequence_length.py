@@ -9,12 +9,13 @@ import json
 import math
 import os
 
+import yaml
 from transformers import AutoTokenizer
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATA_DIR = os.path.join(PROJECT_ROOT, "data")
+CONFIG_DIR = os.path.join(PROJECT_ROOT, "config")
 
-MODEL_ID = "Qwen/Qwen2.5-1.5B"
 SPLITS = ("training", "val", "test")
 COVERAGE_BAND = (0.95, 0.99)
 ROUND_TO = 64
@@ -53,13 +54,23 @@ def choose_max_length(sorted_values: list[int]) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--config", default="qwen2.5-1.5b",
+                        help="training config whose tokenizer to measure with: a model name "
+                             "(e.g. ministral3-8b) or a path (default qwen2.5-1.5b)")
     parser.add_argument("--datadir", default=DATA_DIR)
     parser.add_argument("--max-length", type=int,
                         help="use this length instead of choosing one from the data")
     parser.add_argument("--dry-run", action="store_true", help="report only, write nothing")
     args = parser.parse_args()
 
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    config_path = args.config if os.path.isfile(args.config) \
+        else os.path.join(CONFIG_DIR, f"train_{args.config}.yaml")
+    with open(config_path, encoding="utf-8") as fh:
+        model_cfg = yaml.safe_load(fh)["model"]
+    model_id = model_cfg["base_model"]
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    if model_cfg.get("chat_template"):
+        tokenizer.chat_template = model_cfg["chat_template"]
 
     splits: dict[str, list[dict]] = {}
     lengths: dict[str, list[int]] = {}
@@ -69,7 +80,7 @@ def main() -> None:
         lengths[split] = [sequence_length(tokenizer, p) for p in splits[split]]
 
     pooled = sorted(n for split in SPLITS for n in lengths[split])
-    print(f"Token lengths of {len(pooled)} poems (prompt + poem, {MODEL_ID} chat template)\n")
+    print(f"Token lengths of {len(pooled)} poems (prompt + poem, {model_id} chat template)\n")
     print(f"  min {pooled[0]:>6}    mean {sum(pooled) / len(pooled):>8.1f}    max {pooled[-1]:>6}")
     for q in (0.50, 0.90, 0.95, 0.97, 0.98, 0.99):
         print(f"  p{round(q * 100):<3} {percentile(pooled, q):>6}")
