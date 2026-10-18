@@ -1,6 +1,17 @@
+# scraping and data prep
 requests>=2.31
 beautifulsoup4>=4.12
 langdetect>=1.0.9
-transformers>=4.45
-jinja2>=3.1
 python-dotenv>=1.0
+
+# training and inference
+# torch comes preinstalled with CUDA in Colab; this only checks it's there
+torch>=2.4
+# v5 is needed for Ministral 3 (the Qwen models work on either)
+transformers>=5.0
+peft>=0.19
+# Trainer and device_map="auto" both need it
+accelerate>=1.0
+pyyaml>=6.0
+matplotlib>=3.7
+jinja2>=3.1
